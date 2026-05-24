@@ -13,16 +13,22 @@ use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 use x11rb::rust_connection::RustConnection;
 
 struct SyncState {
-    last_dir: String,
+    last_dir: Option<SyncDir>,
     last_time: i64,
     last_sync_hash: u128,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProcessMode {
     UriList,
     Text,
     Raw,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncDir {
+    X2W,
+    W2X,
 }
 
 #[derive(Clone, Copy)]
@@ -277,6 +283,57 @@ fn normalize_uri_list(data: &[u8]) -> Vec<u8> {
     res.into_bytes()
 }
 
+fn needs_uri_normalization(mode: ProcessMode) -> bool {
+    mode == ProcessMode::UriList
+}
+
+fn should_skip_recent(state: &SyncState, dir: SyncDir, now: i64) -> bool {
+    state.last_dir == Some(match dir {
+        SyncDir::X2W => SyncDir::W2X,
+        SyncDir::W2X => SyncDir::X2W,
+    }) && now - state.last_time < 1000
+}
+
+fn precheck_sync(state: &Arc<Mutex<SyncState>>, dir: SyncDir) -> bool {
+    let state = state.lock().unwrap();
+    should_skip_recent(&state, dir, get_ms())
+}
+
+fn begin_sync(state: &Arc<Mutex<SyncState>>, dir: SyncDir, hash: u128) -> bool {
+    let mut state = state.lock().unwrap();
+    let now = get_ms();
+    if should_skip_recent(&state, dir, now) || state.last_sync_hash == hash {
+        return false;
+    }
+    state.last_dir = Some(dir);
+    state.last_time = now;
+    true
+}
+
+fn finish_sync(state: &Arc<Mutex<SyncState>>, hash: u128) {
+    state.lock().unwrap().last_sync_hash = hash;
+}
+
+fn read_or_log(cmd: &str, args: &[&str], context: &str) -> Option<Vec<u8>> {
+    match read_clipboard(cmd, args) {
+        Ok(data) => Some(data),
+        Err(err) => {
+            log("WARN", &format!("{context}: {err}"));
+            None
+        }
+    }
+}
+
+fn write_or_log(cmd: &str, args: &[&str], data: &[u8], context: &str) -> bool {
+    match write_clipboard(cmd, args, data) {
+        Ok(()) => true,
+        Err(err) => {
+            log("WARN", &format!("{context}: {err}"));
+            false
+        }
+    }
+}
+
 // ==========================================
 // 核心机制：无管道读取与写入 (基于 memfd)
 // ==========================================
@@ -476,7 +533,7 @@ fn main() {
     }
 
     let shared_state = Arc::new(Mutex::new(SyncState {
-        last_dir: String::new(),
+        last_dir: None,
         last_time: 0,
         last_sync_hash: EMPTY_HASH,
     }));
@@ -504,54 +561,30 @@ fn main() {
                     break;
                 }
                 thread::sleep(Duration::from_millis(30));
-
-                {
-                    let state = state_x2w.lock().unwrap();
-                    let now = get_ms();
-                    if state.last_dir == "W2X" && (now - state.last_time < 1000) {
-                        continue;
-                    }
+                if precheck_sync(&state_x2w, SyncDir::X2W) {
+                    continue;
                 }
 
-                let types_raw = match read_clipboard(
+                let Some(types_raw) = read_or_log(
                     "xclip",
                     &["-selection", "clipboard", "-t", "TARGETS", "-o"],
-                ) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        log("WARN", &format!("读取 X11 TARGETS 失败: {}", err));
-                        continue;
-                    }
+                    "读取 X11 TARGETS 失败",
+                ) else {
+                    continue;
                 };
                 let types_str = String::from_utf8_lossy(&types_raw);
-
                 let Some(spec) = detect_x11_clipboard_spec(&types_str) else {
                     continue;
                 };
-
-                let x_data = match read_clipboard("xclip", &["-sel", "clip", "-o", "-t", spec.source_mime]) {
-                    Ok(data) => data,
-                    Err(err) => {
-                        log("WARN", &format!("读取 X11 剪贴板失败: {}", err));
-                        continue;
-                    }
+                let Some(x_data) =
+                    read_or_log("xclip", &["-sel", "clip", "-o", "-t", spec.source_mime], "读取 X11 剪贴板失败")
+                else {
+                    continue;
                 };
                 let current_hash = calc_hash(&x_data, spec.process_mode);
-                if current_hash == EMPTY_HASH {
-                    continue;
-                }
-
+                if current_hash == EMPTY_HASH || !begin_sync(&state_x2w, SyncDir::X2W, current_hash)
                 {
-                    let mut state = state_x2w.lock().unwrap();
-                    let now = get_ms();
-                    if state.last_dir == "W2X" && (now - state.last_time < 1000) {
-                        continue;
-                    }
-                    if current_hash == state.last_sync_hash {
-                        continue;
-                    }
-                    state.last_dir = "X2W".to_string();
-                    state.last_time = now;
+                    continue;
                 }
 
                 log(
@@ -561,21 +594,18 @@ fn main() {
                         (current_hash >> 96) as u32
                     ),
                 );
-
-                let write_data = if spec.process_mode == ProcessMode::UriList {
+                let write_data = if needs_uri_normalization(spec.process_mode) {
                     normalize_uri_list(&x_data)
                 } else {
                     x_data
                 };
-
-                match write_clipboard("wl-copy", &["-t", spec.sync_mime], &write_data) {
-                    Ok(()) => {
-                        let mut state = state_x2w.lock().unwrap();
-                        state.last_sync_hash = current_hash;
-                    }
-                    Err(err) => {
-                        log("WARN", &format!("写入 Wayland 剪贴板失败: {}", err));
-                    }
+                if write_or_log(
+                    "wl-copy",
+                    &["-t", spec.sync_mime],
+                    &write_data,
+                    "写入 Wayland 剪贴板失败",
+                ) {
+                    finish_sync(&state_x2w, current_hash);
                 }
             }
 
@@ -600,59 +630,31 @@ fn main() {
 
     for _line in reader.lines() {
         thread::sleep(Duration::from_millis(30));
-
-        {
-            let state = shared_state.lock().unwrap();
-            let now = get_ms();
-            if state.last_dir == "X2W" && (now - state.last_time < 1000) {
-                continue;
-            }
+        if precheck_sync(&shared_state, SyncDir::W2X) {
+            continue;
         }
-
-        let types_raw = match read_clipboard("wl-paste", &["--list-types"]) {
-            Ok(data) => data,
-            Err(err) => {
-                log("WARN", &format!("读取 Wayland TARGETS 失败: {}", err));
-                continue;
-            }
+        let Some(types_raw) = read_or_log("wl-paste", &["--list-types"], "读取 Wayland TARGETS 失败")
+        else {
+            continue;
         };
         let types_str = String::from_utf8_lossy(&types_raw);
-
         let Some(spec) = detect_wayland_clipboard_spec(&types_str) else {
             continue;
         };
-
-        let w_data = match read_clipboard("wl-paste", &["-t", spec.sync_mime]) {
-            Ok(data) => data,
-            Err(err) => {
-                log("WARN", &format!("读取 Wayland 剪贴板失败: {}", err));
-                continue;
-            }
+        let Some(w_data) = read_or_log("wl-paste", &["-t", spec.sync_mime], "读取 Wayland 剪贴板失败")
+        else {
+            continue;
         };
         let current_hash = calc_hash(&w_data, spec.process_mode);
-        if current_hash == EMPTY_HASH {
+        if current_hash == EMPTY_HASH || !begin_sync(&shared_state, SyncDir::W2X, current_hash) {
             continue;
-        }
-
-        {
-            let mut state = shared_state.lock().unwrap();
-            let now = get_ms();
-            if state.last_dir == "X2W" && (now - state.last_time < 1000) {
-                continue;
-            }
-            if current_hash == state.last_sync_hash {
-                continue;
-            }
-            state.last_dir = "W2X".to_string();
-            state.last_time = now;
         }
 
         log(
             "W2X",
             &format!("写入 X11... (Hash: {:08x})", (current_hash >> 96) as u32),
         );
-
-        let write_data = if spec.process_mode == ProcessMode::UriList {
+        let write_data = if needs_uri_normalization(spec.process_mode) {
             normalize_uri_list(&w_data)
         } else {
             w_data
@@ -662,19 +664,13 @@ fn main() {
             "text/plain;charset=utf-8" | "text/plain" => "UTF8_STRING",
             other => other,
         };
-
-        match write_clipboard(
+        if write_or_log(
             "xclip",
             &["-sel", "clip", "-i", "-t", target_t],
             &write_data,
+            "写入 X11 剪贴板失败",
         ) {
-            Ok(()) => {
-                let mut state = shared_state.lock().unwrap();
-                state.last_sync_hash = current_hash;
-            }
-            Err(err) => {
-                log("WARN", &format!("写入 X11 剪贴板失败: {}", err));
-            }
+            finish_sync(&shared_state, current_hash);
         }
     }
 
