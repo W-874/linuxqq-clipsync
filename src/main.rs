@@ -1,4 +1,3 @@
-use chrono::Utc;
 use memfd::MemfdOptions;
 use std::env;
 use std::fs;
@@ -6,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use xxhash_rust::xxh3::xxh3_128;
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesConnectionExt, SelectionEventMask};
@@ -19,37 +18,202 @@ struct SyncState {
     last_sync_hash: u128,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcessMode {
+    UriList,
+    Text,
+    Raw,
+}
+
+#[derive(Clone, Copy)]
 struct X11ClipboardSpec {
     source_mime: &'static str,
     sync_mime: &'static str,
-    process_mode: &'static str,
+    process_mode: ProcessMode,
 }
 
+#[derive(Clone, Copy)]
 struct WaylandClipboardSpec {
     sync_mime: &'static str,
-    process_mode: &'static str,
+    process_mode: ProcessMode,
 }
 
 const EMPTY_HASH: u128 = 0;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const X11_CLIPBOARD_RULES: &[(&str, X11ClipboardSpec)] = &[
+    (
+        "x-special/gnome-copied-files",
+        X11ClipboardSpec {
+            source_mime: "x-special/gnome-copied-files",
+            sync_mime: "text/uri-list",
+            process_mode: ProcessMode::UriList,
+        },
+    ),
+    (
+        "application/x-qt-image",
+        X11ClipboardSpec {
+            source_mime: "text/uri-list",
+            sync_mime: "text/uri-list",
+            process_mode: ProcessMode::UriList,
+        },
+    ),
+    (
+        "text/uri-list",
+        X11ClipboardSpec {
+            source_mime: "text/uri-list",
+            sync_mime: "text/uri-list",
+            process_mode: ProcessMode::UriList,
+        },
+    ),
+    (
+        "image/png",
+        X11ClipboardSpec {
+            source_mime: "image/png",
+            sync_mime: "image/png",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+    (
+        "image/jpeg",
+        X11ClipboardSpec {
+            source_mime: "image/jpeg",
+            sync_mime: "image/jpeg",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+    (
+        "text/plain;charset=utf-8",
+        X11ClipboardSpec {
+            source_mime: "text/plain;charset=utf-8",
+            sync_mime: "text/plain",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "UTF8_STRING",
+        X11ClipboardSpec {
+            source_mime: "UTF8_STRING",
+            sync_mime: "text/plain",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "STRING",
+        X11ClipboardSpec {
+            source_mime: "STRING",
+            sync_mime: "text/plain",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "text/plain",
+        X11ClipboardSpec {
+            source_mime: "text/plain",
+            sync_mime: "text/plain",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "text/html",
+        X11ClipboardSpec {
+            source_mime: "text/html",
+            sync_mime: "text/html",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+];
+const WAYLAND_CLIPBOARD_RULES: &[(&str, WaylandClipboardSpec)] = &[
+    (
+        "application/x-qt-image",
+        WaylandClipboardSpec {
+            sync_mime: "text/uri-list",
+            process_mode: ProcessMode::UriList,
+        },
+    ),
+    (
+        "text/uri-list",
+        WaylandClipboardSpec {
+            sync_mime: "text/uri-list",
+            process_mode: ProcessMode::UriList,
+        },
+    ),
+    (
+        "image/png",
+        WaylandClipboardSpec {
+            sync_mime: "image/png",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+    (
+        "image/jpeg",
+        WaylandClipboardSpec {
+            sync_mime: "image/jpeg",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+    (
+        "text/plain;charset=utf-8",
+        WaylandClipboardSpec {
+            sync_mime: "text/plain;charset=utf-8",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "UTF8_STRING",
+        WaylandClipboardSpec {
+            sync_mime: "UTF8_STRING",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "STRING",
+        WaylandClipboardSpec {
+            sync_mime: "STRING",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "text/plain",
+        WaylandClipboardSpec {
+            sync_mime: "text/plain",
+            process_mode: ProcessMode::Text,
+        },
+    ),
+    (
+        "text/html",
+        WaylandClipboardSpec {
+            sync_mime: "text/html",
+            process_mode: ProcessMode::Raw,
+        },
+    ),
+];
 
 fn log(level: &str, msg: &str) {
-    let now = Utc::now().format("%H:%M:%S").to_string();
-    println!("[{}] [{}] {}", now, level, msg);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() % 86_400)
+        .unwrap_or(0);
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    println!("[{h:02}:{m:02}:{s:02}] [{level}] {msg}");
 }
 
 fn get_ms() -> i64 {
-    Utc::now().timestamp_millis()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // 优化 1：零拷贝 Hash，拒绝为大图片分配多余内存
-fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
+fn calc_hash(data: &[u8], process_mode: ProcessMode) -> u128 {
     if data.is_empty() {
         return EMPTY_HASH;
     }
 
     match process_mode {
-        "uri-list" => {
+        ProcessMode::UriList => {
             let s = String::from_utf8_lossy(data);
             let mut result = String::new();
             for line in s.lines() {
@@ -66,7 +230,7 @@ fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
                 xxh3_128(&processed)
             }
         }
-        "text" => {
+        ProcessMode::Text => {
             let s = String::from_utf8_lossy(data);
             let result: String = s
                 .chars()
@@ -79,114 +243,20 @@ fn calc_hash(data: &[u8], process_mode: &str) -> u128 {
                 xxh3_128(&processed)
             }
         }
-        _ => xxh3_128(data), // 对于图片直接 Hash 原数组，绝对不 clone！
+        ProcessMode::Raw => xxh3_128(data),
     }
 }
 
 fn detect_x11_clipboard_spec(types_str: &str) -> Option<X11ClipboardSpec> {
-    if types_str.contains("x-special/gnome-copied-files") {
-        Some(X11ClipboardSpec {
-            source_mime: "x-special/gnome-copied-files",
-            sync_mime: "text/uri-list",
-            process_mode: "uri-list",
-        })
-    } else if types_str.contains("application/x-qt-image") || types_str.contains("text/uri-list") {
-        Some(X11ClipboardSpec {
-            source_mime: "text/uri-list",
-            sync_mime: "text/uri-list",
-            process_mode: "uri-list",
-        })
-    } else if types_str.contains("image/png") {
-        Some(X11ClipboardSpec {
-            source_mime: "image/png",
-            sync_mime: "image/png",
-            process_mode: "raw",
-        })
-    } else if types_str.contains("image/jpeg") {
-        Some(X11ClipboardSpec {
-            source_mime: "image/jpeg",
-            sync_mime: "image/jpeg",
-            process_mode: "raw",
-        })
-    } else if types_str.contains("text/plain;charset=utf-8") {
-        Some(X11ClipboardSpec {
-            source_mime: "text/plain;charset=utf-8",
-            sync_mime: "text/plain",
-            process_mode: "text",
-        })
-    } else if types_str.contains("UTF8_STRING") {
-        Some(X11ClipboardSpec {
-            source_mime: "UTF8_STRING",
-            sync_mime: "text/plain",
-            process_mode: "text",
-        })
-    } else if types_str.contains("STRING") {
-        Some(X11ClipboardSpec {
-            source_mime: "STRING",
-            sync_mime: "text/plain",
-            process_mode: "text",
-        })
-    } else if types_str.contains("text/plain") {
-        Some(X11ClipboardSpec {
-            source_mime: "text/plain",
-            sync_mime: "text/plain",
-            process_mode: "text",
-        })
-    } else if types_str.contains("text/html") {
-        Some(X11ClipboardSpec {
-            source_mime: "text/html",
-            sync_mime: "text/html",
-            process_mode: "raw",
-        })
-    } else {
-        None
-    }
+    X11_CLIPBOARD_RULES
+        .iter()
+        .find_map(|(needle, spec)| types_str.contains(needle).then_some(*spec))
 }
 
 fn detect_wayland_clipboard_spec(types_str: &str) -> Option<WaylandClipboardSpec> {
-    if types_str.contains("application/x-qt-image") || types_str.contains("text/uri-list") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "text/uri-list",
-            process_mode: "uri-list",
-        })
-    } else if types_str.contains("image/png") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "image/png",
-            process_mode: "raw",
-        })
-    } else if types_str.contains("image/jpeg") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "image/jpeg",
-            process_mode: "raw",
-        })
-    } else if types_str.contains("text/plain;charset=utf-8") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "text/plain;charset=utf-8",
-            process_mode: "text",
-        })
-    } else if types_str.contains("UTF8_STRING") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "UTF8_STRING",
-            process_mode: "text",
-        })
-    } else if types_str.contains("STRING") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "STRING",
-            process_mode: "text",
-        })
-    } else if types_str.contains("text/plain") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "text/plain",
-            process_mode: "text",
-        })
-    } else if types_str.contains("text/html") {
-        Some(WaylandClipboardSpec {
-            sync_mime: "text/html",
-            process_mode: "raw",
-        })
-    } else {
-        None
-    }
+    WAYLAND_CLIPBOARD_RULES
+        .iter()
+        .find_map(|(needle, spec)| types_str.contains(needle).then_some(*spec))
 }
 
 fn normalize_uri_list(data: &[u8]) -> Vec<u8> {
@@ -492,7 +562,7 @@ fn main() {
                     ),
                 );
 
-                let write_data = if spec.process_mode == "uri-list" {
+                let write_data = if spec.process_mode == ProcessMode::UriList {
                     normalize_uri_list(&x_data)
                 } else {
                     x_data
@@ -582,7 +652,7 @@ fn main() {
             &format!("写入 X11... (Hash: {:08x})", (current_hash >> 96) as u32),
         );
 
-        let write_data = if spec.process_mode == "uri-list" {
+        let write_data = if spec.process_mode == ProcessMode::UriList {
             normalize_uri_list(&w_data)
         } else {
             w_data
