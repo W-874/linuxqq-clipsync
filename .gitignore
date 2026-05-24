@@ -1,2 +1,4 @@
 /target
 changelog.md
+results_*/
+*.src.rpm
