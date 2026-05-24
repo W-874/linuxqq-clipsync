@@ -4,7 +4,7 @@
 
 - 依赖
 
-    `xclip` `wl-clipboard` `clipnotify`
+    `xclip` `wl-clipboard`
 
 - 安装
 
@@ -19,4 +19,3 @@
     ```
     systemctl enable --user linuxqq-clipsync
     ```
-

@@ -8,6 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use xxhash_rust::xxh3::xxh3_128;
+use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::xfixes::{self, ConnectionExt as XfixesConnectionExt, SelectionEventMask};
+use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
+use x11rb::rust_connection::RustConnection;
 
 struct SyncState {
     last_dir: String,
@@ -126,6 +130,57 @@ fn get_xdg_runtime_dir() -> String {
     format!("/run/user/{}", unsafe { libc::getuid() })
 }
 
+fn connect_x11_clipboard_watcher(display: &str) -> Result<RustConnection, String> {
+    let (conn, screen_num) =
+        x11rb::connect(Some(display)).map_err(|e| format!("X11 连接失败: {e}"))?;
+    init_xfixes_clipboard_watch(&conn, screen_num)?;
+    Ok(conn)
+}
+
+fn wait_for_x11_clipboard_event(conn: &RustConnection) -> Result<(), String> {
+    loop {
+        let event = conn
+            .wait_for_event()
+            .map_err(|e| format!("等待 X11 事件失败: {e}"))?;
+
+        if let x11rb::protocol::Event::XfixesSelectionNotify(_) = event {
+            return Ok(());
+        }
+    }
+}
+
+fn init_xfixes_clipboard_watch(conn: &RustConnection, screen_num: usize) -> Result<(), String> {
+    conn.extension_information(xfixes::X11_EXTENSION_NAME)
+        .map_err(|e| format!("查询 XFixes 扩展失败: {e}"))?
+        .ok_or_else(|| "X11 服务器未提供 XFixes 扩展".to_string())?;
+
+    conn.xfixes_query_version(5, 0)
+        .map_err(|e| format!("XFixes 版本协商失败: {e}"))?
+        .reply()
+        .map_err(|e| format!("获取 XFixes 版本回复失败: {e}"))?;
+
+    let clipboard = conn
+        .intern_atom(false, b"CLIPBOARD")
+        .map_err(|e| format!("查询 CLIPBOARD atom 失败: {e}"))?
+        .reply()
+        .map_err(|e| format!("获取 CLIPBOARD atom 回复失败: {e}"))?
+        .atom;
+
+    let screen = &conn.setup().roots[screen_num];
+    conn.xfixes_select_selection_input(
+        screen.root,
+        clipboard,
+        SelectionEventMask::SET_SELECTION_OWNER
+            | SelectionEventMask::SELECTION_WINDOW_DESTROY
+            | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+    )
+    .map_err(|e| format!("注册 X11 剪贴板监听失败: {e}"))?;
+
+    conn.flush()
+        .map_err(|e| format!("刷新 X11 请求失败: {e}"))?;
+    Ok(())
+}
+
 fn main() {
     let xdg_runtime_dir = get_xdg_runtime_dir();
     env::set_var("XDG_RUNTIME_DIR", &xdg_runtime_dir);
@@ -202,90 +257,109 @@ fn main() {
     // X2W 线程
     // ==========================================
     let state_x2w = Arc::clone(&shared_state);
+    let display_x2w = display.clone();
     thread::spawn(move || {
         log("INFO", "=== [X2W] 线程启动 ===");
         loop {
-            let _ = Command::new("clipnotify").status();
-            thread::sleep(Duration::from_millis(30));
-
-            // 优化 2：【前置全局排他锁】在此处锁死状态，彻底杜绝并发竞争，利用短路求值拦截回音！
-            let mut state = state_x2w.lock().unwrap();
-            let now = get_ms();
-            if state.last_dir == "W2X" && (now - state.last_time < 1000) {
-                continue;
-            }
-
-            let types_raw =
-                read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]);
-            let types_str = String::from_utf8_lossy(&types_raw);
-
-            let (source_mime, sync_mime, process_mode) =
-                if types_str.contains("x-special/gnome-copied-files") {
-                    ("x-special/gnome-copied-files", "text/uri-list", "uri-list")
-                } else if types_str.contains("application/x-qt-image")
-                    || types_str.contains("text/uri-list")
-                {
-                    ("text/uri-list", "text/uri-list", "uri-list")
-                } else if types_str.contains("image/png") {
-                    ("image/png", "image/png", "raw")
-                } else if types_str.contains("image/jpeg") {
-                    ("image/jpeg", "image/jpeg", "raw")
-                } else if types_str.contains("text/plain;charset=utf-8") {
-                    ("text/plain;charset=utf-8", "text/plain", "text")
-                } else if types_str.contains("UTF8_STRING") {
-                    ("UTF8_STRING", "text/plain", "text")
-                } else if types_str.contains("text/plain") {
-                    ("text/plain", "text/plain", "text")
-                } else if types_str.contains("text/html") {
-                    ("text/html", "text/html", "raw")
-                } else {
+            let conn = match connect_x11_clipboard_watcher(&display_x2w) {
+                Ok(conn) => conn,
+                Err(err) => {
+                    log("ERROR", &format!("X11 监听初始化失败: {}", err));
+                    thread::sleep(Duration::from_secs(1));
                     continue;
-                };
-
-            let x_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", source_mime]);
-            let current_hash = calc_hash(&x_data, process_mode);
-            if current_hash == EMPTY_HASH {
-                continue;
-            }
-
-            // 优化 3：移除极其冗余的二次目标查壳（w_check_data），直接依靠记录的 hash 防环
-            if current_hash == state.last_sync_hash {
-                continue;
-            }
-
-            log(
-                "X2W",
-                &format!(
-                    "写入 Wayland... (Hash: {:08x})",
-                    (current_hash >> 96) as u32
-                ),
-            );
-            state.last_dir = "X2W".to_string();
-            state.last_time = get_ms();
-
-            let write_data = if process_mode == "uri-list" {
-                let s = String::from_utf8_lossy(&x_data);
-                let mut res = String::new();
-                for line in s.lines() {
-                    if line == "copy" || line == "cut" {
-                        continue;
-                    }
-                    if line.starts_with('/') {
-                        res.push_str("file:///");
-                        res.push_str(&line[1..]);
-                    } else {
-                        res.push_str(line);
-                    }
-                    res.push('\n');
                 }
-                res.into_bytes()
-            } else {
-                x_data
             };
 
-            if write_clipboard("wl-copy", &["-t", sync_mime], &write_data) {
-                state.last_sync_hash = current_hash;
+            loop {
+                if let Err(err) = wait_for_x11_clipboard_event(&conn) {
+                    log("ERROR", &format!("X11 监听失败: {}", err));
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+
+                // 优化 2：【前置全局排他锁】在此处锁死状态，彻底杜绝并发竞争，利用短路求值拦截回音！
+                let mut state = state_x2w.lock().unwrap();
+                let now = get_ms();
+                if state.last_dir == "W2X" && (now - state.last_time < 1000) {
+                    continue;
+                }
+
+                let types_raw =
+                    read_clipboard("xclip", &["-selection", "clipboard", "-t", "TARGETS", "-o"]);
+                let types_str = String::from_utf8_lossy(&types_raw);
+
+                let (source_mime, sync_mime, process_mode) =
+                    if types_str.contains("x-special/gnome-copied-files") {
+                        ("x-special/gnome-copied-files", "text/uri-list", "uri-list")
+                    } else if types_str.contains("application/x-qt-image")
+                        || types_str.contains("text/uri-list")
+                    {
+                        ("text/uri-list", "text/uri-list", "uri-list")
+                    } else if types_str.contains("image/png") {
+                        ("image/png", "image/png", "raw")
+                    } else if types_str.contains("image/jpeg") {
+                        ("image/jpeg", "image/jpeg", "raw")
+                    } else if types_str.contains("text/plain;charset=utf-8") {
+                        ("text/plain;charset=utf-8", "text/plain", "text")
+                    } else if types_str.contains("UTF8_STRING") {
+                        ("UTF8_STRING", "text/plain", "text")
+                    } else if types_str.contains("STRING") {
+                        ("STRING", "text/plain", "text")
+                    } else if types_str.contains("text/plain") {
+                        ("text/plain", "text/plain", "text")
+                    } else if types_str.contains("text/html") {
+                        ("text/html", "text/html", "raw")
+                    } else {
+                        continue;
+                    };
+
+                let x_data = read_clipboard("xclip", &["-sel", "clip", "-o", "-t", source_mime]);
+                let current_hash = calc_hash(&x_data, process_mode);
+                if current_hash == EMPTY_HASH {
+                    continue;
+                }
+
+                // 优化 3：移除极其冗余的二次目标查壳（w_check_data），直接依靠记录的 hash 防环
+                if current_hash == state.last_sync_hash {
+                    continue;
+                }
+
+                log(
+                    "X2W",
+                    &format!(
+                        "写入 Wayland... (Hash: {:08x})",
+                        (current_hash >> 96) as u32
+                    ),
+                );
+                state.last_dir = "X2W".to_string();
+                state.last_time = get_ms();
+
+                let write_data = if process_mode == "uri-list" {
+                    let s = String::from_utf8_lossy(&x_data);
+                    let mut res = String::new();
+                    for line in s.lines() {
+                        if line == "copy" || line == "cut" {
+                            continue;
+                        }
+                        if line.starts_with('/') {
+                            res.push_str("file:///");
+                            res.push_str(&line[1..]);
+                        } else {
+                            res.push_str(line);
+                        }
+                        res.push('\n');
+                    }
+                    res.into_bytes()
+                } else {
+                    x_data
+                };
+
+                if write_clipboard("wl-copy", &["-t", sync_mime], &write_data) {
+                    state.last_sync_hash = current_hash;
+                }
             }
+
+            thread::sleep(Duration::from_secs(1));
         }
     });
 
@@ -327,6 +401,10 @@ fn main() {
             ("image/jpeg", "raw")
         } else if types_str.contains("text/plain;charset=utf-8") {
             ("text/plain;charset=utf-8", "text")
+        } else if types_str.contains("UTF8_STRING") {
+            ("UTF8_STRING", "text")
+        } else if types_str.contains("STRING") {
+            ("STRING", "text")
         } else if types_str.contains("text/plain") {
             ("text/plain", "text")
         } else if types_str.contains("text/html") {
