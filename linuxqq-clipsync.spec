@@ -14,6 +14,7 @@ BuildRequires:  rust-packaging
 BuildRequires:  systemd-rpm-macros
 Requires:       wl-clipboard
 Requires:       xclip
+ExclusiveArch:  %{rust_arches}
 
 %description
 linuxqq-clipsync synchronizes the X11 and Wayland clipboards to work around
@@ -21,6 +22,7 @@ clipboard interoperability issues when LinuxQQ runs on Wayland.
 
 %prep
 %autosetup -n %{name}-%{commit}
+%cargo_prep
 
 %generate_buildrequires
 %cargo_generate_buildrequires
