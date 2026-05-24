@@ -3,11 +3,11 @@ Version:        0.1.0
 Release:        1%{?dist}
 Summary:        Clipboard bridge between X11 and Wayland for LinuxQQ
 
-%global commit 8e8748335b340b8216c409ad47d4f9f3c4c970e9
+%global commit 357e5b67a897fe218d77bb79f013483bb9df10e2
 
 License:        MIT
 URL:            https://github.com/W-874/linuxqq-clipsync
-Source0:        %{url}/archive/8e8748335b340b8216c409ad47d4f9f3c4c970e9/%{name}-%{commit}.tar.gz
+Source0:        %{url}/archive/%{commit}/%{name}-%{commit}.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rust-packaging

@@ -12,6 +12,13 @@
     yay -S linuxqq-clipsync-git
     ```
 
+    Fedora / COPR:
+
+    ```
+    sudo dnf copr enable walker874/linuxqq-clipsync
+    sudo dnf install linuxqq-clipsync
+    ```
+
 - 使用
 
     运行`linuxqq-clipsync`命令即可，但是更推荐使用systemd服务。 
